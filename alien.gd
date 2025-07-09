@@ -10,115 +10,123 @@ extends CharacterBody3D
 
 @onready var camera_pivot = $CameraPivot
 @onready var camera = $CameraPivot/Camera3D
-@onready var mesh_instance = $MeshInstance3D
 
 var is_network_ready: bool = false
-var last_sync_time: float = 0.0
-const SYNC_INTERVAL: float = 0.016  # 60 FPS sync rate for smooth movement
+var setup_complete: bool = false
 
-@rpc("any_peer", "unreliable")
-func sync_state(pos: Vector3, vel: Vector3, rot_y: float, rot_x: float):
+@rpc("any_peer", "call_local", "unreliable")
+func sync_state(pos: Vector3, vel: Vector3):
 	if not is_multiplayer_authority():
-		# Smooth interpolation for remote players
-		var tween = create_tween()
-		tween.set_parallel(true)
-		tween.tween_property(self, "global_position", pos, 0.1)
-		tween.tween_property(self, "rotation:y", rot_y, 0.1)
-		if camera_pivot:
-			tween.tween_property(camera_pivot, "rotation:x", rot_x, 0.1)
+		global_transform.origin = pos
 		velocity = vel
 
 func _ready():
+	print("Player _ready() called for ", name, " with authority ", get_multiplayer_authority())
 	add_to_group("players")
-	print("Player _ready called for: ", get_multiplayer_authority(), " (", player_type, ")")
 	
 	# Set team-specific visuals
-	setup_visuals()
+	_setup_visuals()
 	
-	# Setup based on authority
-	if is_multiplayer_authority():
-		print("Setting up LOCAL player: ", get_multiplayer_authority())
-		# This is the local player
-		set_physics_process(true)
-		set_process_input(true)
-	else:
-		print("Setting up REMOTE player: ", get_multiplayer_authority())
-		# This is a remote player
-		set_physics_process(false)
-		set_process_input(false)
-	
-	# Setup camera after a frame to ensure everything is ready
+	# Wait for proper scene setup
 	await get_tree().process_frame
-	setup_camera()
+	await get_tree().process_frame
 	
-	# Mark as network ready
+	# Setup camera and controls
+	_setup_camera_and_controls()
+	
+	# Wait a bit more for network stability
 	await get_tree().create_timer(0.5).timeout
 	is_network_ready = true
-	print("Player network ready: ", get_multiplayer_authority(), " (", player_type, ")")
+	setup_complete = true
+	
+	print("Player setup complete for ", name, " (authority: ", get_multiplayer_authority(), ", local: ", is_multiplayer_authority(), ")")
 
-func setup_visuals():
+func _setup_visuals():
+	var mesh_instance = get_node_or_null("MeshInstance3D")
 	if mesh_instance:
 		var material = StandardMaterial3D.new()
-		if player_type == "human":
-			material.albedo_color = Color.BLUE
-		else:  # alien
-			material.albedo_color = Color.RED
-		material.albedo_color.a = 0.9
+		material.albedo_color = Color.BLUE if player_type == "human" else Color.RED
 		mesh_instance.material_override = material
-		print("Set material for ", player_type, " player: ", get_multiplayer_authority())
+		print("Set visual for ", player_type, " player")
 	else:
 		print("Warning: No MeshInstance3D found for player ", player_type)
 
-func setup_camera():
-	if not camera or not camera_pivot:
-		print("ERROR: Camera or CameraPivot not found for player ", get_multiplayer_authority())
-		return
+func _setup_camera_and_controls():
+	# Try to find camera components with error handling
+	if not camera_pivot:
+		camera_pivot = get_node_or_null("CameraPivot")
+		if not camera_pivot:
+			print("ERROR: CameraPivot not found for player ", get_multiplayer_authority())
+			return
+	
+	if not camera:
+		camera = get_node_or_null("CameraPivot/Camera3D")
+		if not camera:
+			print("ERROR: Camera3D not found for player ", get_multiplayer_authority())
+			return
+	
+	print("Setting up camera for player ", get_multiplayer_authority(), " (is_authority: ", is_multiplayer_authority(), ")")
 	
 	if is_multiplayer_authority():
-		print("Setting up camera for LOCAL player: ", get_multiplayer_authority())
+		print("This is the local player (", player_type, ") - activating camera")
 		camera.current = true
-		camera.fov = 70.0
-		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+		
+		# Set mouse mode with a small delay to ensure scene is ready
+		call_deferred("_set_mouse_mode")
 	else:
-		print("Disabling camera for REMOTE player: ", get_multiplayer_authority())
+		print("This is a remote player (", player_type, ") - deactivating camera")
 		camera.current = false
-		# Make sure remote players are visible
-		visible = true
+
+func _set_mouse_mode():
+	if is_multiplayer_authority():
+		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+		print("Mouse captured for local player")
 
 func _input(event):
-	if not is_multiplayer_authority():
+	if not setup_complete or not is_multiplayer_authority():
 		return
 	
 	if event is InputEventMouseMotion:
-		rotate_y(-event.relative.x * mouse_sensitivity)
-		if camera_pivot:
-			camera_pivot.rotate_x(-event.relative.y * mouse_sensitivity)
-			var current_rotation = camera_pivot.rotation_degrees.x
-			current_rotation = clamp(current_rotation, -vertical_look_limit, vertical_look_limit)
-			camera_pivot.rotation_degrees.x = current_rotation
-		# Sync immediately on mouse movement for responsive feel
-		if is_network_ready:
-			sync_state_to_peers()
+		_handle_mouse_look(event)
+
+func _handle_mouse_look(event: InputEventMouseMotion):
+	if not camera_pivot:
+		return
+		
+	# Horizontal rotation (Y-axis)
+	rotate_y(-event.relative.x * mouse_sensitivity)
+	
+	# Vertical rotation (X-axis) - constrained
+	camera_pivot.rotate_x(-event.relative.y * mouse_sensitivity)
+	var current_rotation = camera_pivot.rotation_degrees.x
+	current_rotation = clamp(current_rotation, -vertical_look_limit, vertical_look_limit)
+	camera_pivot.rotation_degrees.x = current_rotation
 
 func _physics_process(delta):
-	if not is_multiplayer_authority():
+	if not setup_complete or not is_multiplayer_authority():
 		return
 	
 	process_input(delta)
 	
-	# Sync state every frame for smooth movement
-	if is_network_ready:
-		sync_state_to_peers()
+	# Only sync if we have a valid multiplayer setup and peers
+	if is_network_ready and can_use_rpc():
+		sync_state.rpc(global_transform.origin, velocity)
+
+func can_use_rpc() -> bool:
+	return (multiplayer and 
+			multiplayer.has_multiplayer_peer() and 
+			get_multiplayer_authority() != 0 and
+			multiplayer.get_peers().size() > 0)
 
 func process_input(delta):
-	# Toggle mouse capture
+	# Handle escape key for mouse toggle
 	if Input.is_action_just_pressed("ui_cancel"):
 		if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 			Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 		else:
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	
-	# Movement input
+	# Handle movement
 	var input_dir = Vector3.ZERO
 	if Input.is_action_pressed("move_forward"):
 		input_dir.z -= 1
@@ -144,18 +152,6 @@ func process_input(delta):
 		velocity.y -= ProjectSettings.get_setting("physics/3d/default_gravity") * delta
 	
 	move_and_slide()
-
-func sync_state_to_peers():
-	if not is_network_ready:
-		return
-	
-	var multiplayer_api = get_tree().get_multiplayer()
-	if not multiplayer_api or not multiplayer_api.has_multiplayer_peer():
-		return
-	
-	if multiplayer_api.get_peers().size() > 0:
-		var cam_rot_x = camera_pivot.rotation.x if camera_pivot else 0.0
-		rpc("sync_state", global_transform.origin, velocity, rotation.y, cam_rot_x)
 
 func is_player() -> bool:
 	return true

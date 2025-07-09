@@ -232,9 +232,6 @@ func generate_game_map():
 func spawn_all_players():
 	print("Spawning all players...")
 	
-	if not multiplayer.is_server():
-		return
-	
 	# Get all connected peers
 	var connected_players = multiplayer.get_peers()
 	connected_players.append(multiplayer.get_unique_id())
@@ -242,27 +239,33 @@ func spawn_all_players():
 	print("Connected players: ", connected_players)
 	print("Team assignments: ", player_teams)
 	
-	# Spawn each player
+	# FIXED: Let everyone spawn their own player locally, then sync positions
 	for player_id in connected_players:
 		var team = player_teams.get(player_id, 0)
 		var player_type = "human" if team == 0 else "alien"
+		var spawn_position = get_spawn_position_for_team(team)
 		
 		print("Spawning player ", player_id, " as ", player_type, " on team ", team)
-		await spawn_player(player_id, player_type, team)
+		
+		# Tell everyone (including self) to spawn this player
+		rpc("spawn_player_everywhere", player_id, player_type, team, spawn_position)
 		
 		# Small delay between spawns to prevent issues
 		await get_tree().create_timer(0.1).timeout
 	
 	print("All players spawned!")
 
-func spawn_player(player_id: int, player_type: String, team: int):
-	if not multiplayer.is_server():
+# FIXED: New RPC that ensures everyone spawns everyone (including themselves)
+@rpc("any_peer", "call_local", "reliable")
+func spawn_player_everywhere(player_id: int, player_type: String, team: int, spawn_position: Vector3):
+	print("Spawning player ", player_id, " as ", player_type, " locally")
+	
+	# Don't spawn if already exists
+	if player_id in players and is_instance_valid(players[player_id]):
+		print("Player ", player_id, " already exists, skipping spawn")
 		return
 	
-	print("Spawning player ", player_id, " as ", player_type)
-	
-	# FIXED: Don't look for existing players - always create fresh ones
-	var spawn_position = get_spawn_position_for_team(team)
+	# Create player instance
 	var player_scene = alien_scene if player_type == "alien" else human_scene
 	var player_instance = player_scene.instantiate()
 	
@@ -276,7 +279,7 @@ func spawn_player(player_id: int, player_type: String, team: int):
 	# Wait for node to be properly added
 	await get_tree().process_frame
 	
-	# FIXED: Set authority and position AFTER adding to scene
+	# Set authority and position AFTER adding to scene
 	player_instance.set_multiplayer_authority(player_id)
 	player_instance.global_position = spawn_position
 	
@@ -291,60 +294,17 @@ func spawn_player(player_id: int, player_type: String, team: int):
 	if not player_instance.is_in_group("players"):
 		player_instance.add_to_group("players")
 	
-	print("✓ Player ", player_id, " spawned at ", spawn_position)
-	
-	# Notify all clients
-	rpc("on_player_spawned", player_id, player_type, spawn_position)
-
-@rpc("any_peer", "call_local", "reliable")
-func on_player_spawned(player_id: int, player_type: String, position: Vector3):
-	print("Player spawned notification: ", player_id, " as ", player_type)
-	
-	# FIXED: If this is not the server, create the player locally
-	if not multiplayer.is_server():
-		var existing_player = get_tree().current_scene.get_node_or_null("Player_" + str(player_id))
-		if not existing_player:
-			_create_remote_player(player_id, player_type, position)
+	# Check if this is the local player
+	var is_local_player = player_id == multiplayer.get_unique_id()
+	print("✓ Player ", player_id, " spawned at ", spawn_position, " (local: ", is_local_player, ")")
 	
 	# Debug: Show current players
 	var all_players = get_tree().get_nodes_in_group("players")
 	print("Current players in scene:")
 	for player in all_players:
-		print("  - ", player.name, " (authority: ", player.get_multiplayer_authority(), ")")
-
-# FIXED: Add function to create remote players on clients
-func _create_remote_player(player_id: int, player_type: String, position: Vector3):
-	print("Creating remote player: ", player_id, " as ", player_type)
-	
-	# Don't create ourselves
-	if player_id == multiplayer.get_unique_id():
-		return
-	
-	var player_scene = alien_scene if player_type == "alien" else human_scene
-	var player_instance = player_scene.instantiate()
-	
-	# Set properties BEFORE adding to scene
-	player_instance.name = "Player_" + str(player_id)
-	player_instance.player_type = player_type
-	
-	# Add to scene
-	get_tree().current_scene.add_child(player_instance)
-	
-	# Wait for node to be properly added
-	await get_tree().process_frame
-	
-	# Set authority and position AFTER adding to scene
-	player_instance.set_multiplayer_authority(player_id)
-	player_instance.global_position = position
-	
-	# Store reference
-	players[player_id] = player_instance
-	
-	# Add to group
-	if not player_instance.is_in_group("players"):
-		player_instance.add_to_group("players")
-	
-	print("✓ Remote player ", player_id, " created at ", position)
+		var authority = player.get_multiplayer_authority()
+		var is_local = authority == multiplayer.get_unique_id()
+		print("  - ", player.name, " (authority: ", authority, ", local: ", is_local, ")")
 
 func get_spawn_position_for_team(team: int) -> Vector3:
 	var team_name = "human" if team == 0 else "alien"

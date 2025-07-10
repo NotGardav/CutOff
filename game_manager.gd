@@ -40,27 +40,25 @@ func _initialize_game_scene():
 func _notify_server_with_retry():
 	var retry_count = 0
 	var max_retries = 10
+	var acknowledged = false
 	
-	while retry_count < max_retries:
+	while retry_count < max_retries and not acknowledged:
 		print("Client notifying server of readiness (attempt ", retry_count + 1, ")")
 		rpc_id(1, "client_ready_for_game")
 		
 		# Wait for acknowledgment
-		await get_tree().create_timer(0.5).timeout
+		await get_tree().create_timer(1.0).timeout
 		
-		# Check if server acknowledged
-		if _is_acknowledged_by_server():
+		# Check if we received acknowledgment
+		if clients_ready.get(multiplayer.get_unique_id(), false):
 			print("Server acknowledged client readiness")
+			acknowledged = true
 			break
 		
 		retry_count += 1
-		
-		if retry_count >= max_retries:
-			print("ERROR: Failed to notify server after ", max_retries, " attempts")
-			break
-
-func _is_acknowledged_by_server() -> bool:
-	return multiplayer.get_peers().size() > 0 or multiplayer.is_server()
+	
+	if not acknowledged:
+		print("ERROR: Failed to get server acknowledgment after ", max_retries, " attempts")
 
 func _on_peer_connected(id):
 	print("Peer connected: ", id)
@@ -89,6 +87,7 @@ func _check_game_scene_loaded():
 		return
 	
 	print("Checking scene: ", scene_root.name)
+	print("Client ID: ", multiplayer.get_unique_id())
 	
 	# Find map generator
 	map_generator = scene_root.get_node_or_null("MapGenerator")
@@ -96,15 +95,20 @@ func _check_game_scene_loaded():
 		var map_nodes = get_tree().get_nodes_in_group("map_generator")
 		if map_nodes.size() > 0:
 			map_generator = map_nodes[0]
+			print("Found MapGenerator in group: ", map_generator.name)
 	
 	if map_generator and is_instance_valid(map_generator):
 		game_scene_loaded = true
 		print("Game scene loaded successfully with MapGenerator")
+		print("MapGenerator node path: ", map_generator.get_path())
 		
 		# Import lobby data immediately when scene is ready
 		_import_lobby_data()
 	else:
 		print("MapGenerator not found - retrying in 0.5 seconds")
+		print("Available nodes in scene:")
+		for child in scene_root.get_children():
+			print("  - ", child.name, " (", child.get_class(), ")")
 		await get_tree().create_timer(0.5).timeout
 		_check_game_scene_loaded()
 
@@ -149,6 +153,7 @@ func client_ready_for_game():
 @rpc("any_peer", "reliable")
 func server_acknowledges_client_ready():
 	print("Server acknowledged client readiness")
+	clients_ready[multiplayer.get_unique_id()] = true
 
 func _check_if_all_ready():
 	if not multiplayer.is_server():
@@ -201,8 +206,10 @@ func _start_game_synchronized():
 	# Clear any existing conflicting data
 	players.clear()
 	
-	# Generate map first
-	await generate_game_map()
+	# Generate map on ALL clients using RPC
+	print("Requesting map generation on all clients...")
+	rpc("generate_game_map_rpc")
+	await get_tree().create_timer(2.0).timeout  # Wait for map generation to complete
 	
 	# Then spawn players
 	await spawn_all_players()
@@ -216,18 +223,42 @@ func _start_game_synchronized():
 	# Notify all clients that game is ready
 	rpc("on_game_fully_ready")
 
+# NEW: RPC function to generate map on all clients
+@rpc("any_peer", "call_local", "reliable")
+func generate_game_map_rpc():
+	print("=== GENERATING GAME MAP ON CLIENT ===")
+	print("Client ID: ", multiplayer.get_unique_id())
+	print("Is server: ", multiplayer.is_server())
+	
+	if map_generator and is_instance_valid(map_generator):
+		print("MapGenerator found, generating layout...")
+		await map_generator.generate_base_layout()
+		print("Map generation complete on client ", multiplayer.get_unique_id())
+	else:
+		print("ERROR: MapGenerator not available on client ", multiplayer.get_unique_id())
+		print("Attempting to find MapGenerator again...")
+		
+		# Try to find it again
+		var scene_root = get_tree().current_scene
+		if scene_root:
+			map_generator = scene_root.get_node_or_null("MapGenerator")
+			if not map_generator:
+				var map_nodes = get_tree().get_nodes_in_group("map_generator")
+				if map_nodes.size() > 0:
+					map_generator = map_nodes[0]
+			
+			if map_generator and is_instance_valid(map_generator):
+				print("Found MapGenerator on retry, generating layout...")
+				await map_generator.generate_base_layout()
+				print("Map generation complete on client ", multiplayer.get_unique_id())
+			else:
+				print("CRITICAL ERROR: Still no MapGenerator found on client ", multiplayer.get_unique_id())
+
 @rpc("any_peer", "call_local", "reliable")
 func on_game_fully_ready():
 	print("Game is fully ready!")
 
-func generate_game_map():
-	print("Generating game map...")
-	if map_generator and is_instance_valid(map_generator):
-		print("Generating map layout...")
-		await map_generator.generate_base_layout()
-		print("Map generation complete!")
-	else:
-		print("ERROR: MapGenerator not available!")
+# REMOVED: Old generate_game_map function (replaced with RPC version)
 
 func spawn_all_players():
 	print("Spawning all players...")
@@ -239,7 +270,7 @@ func spawn_all_players():
 	print("Connected players: ", connected_players)
 	print("Team assignments: ", player_teams)
 	
-	# FIXED: Let everyone spawn their own player locally, then sync positions
+	# Let everyone spawn their own player locally, then sync positions
 	for player_id in connected_players:
 		var team = player_teams.get(player_id, 0)
 		var player_type = "human" if team == 0 else "alien"
@@ -255,7 +286,6 @@ func spawn_all_players():
 	
 	print("All players spawned!")
 
-# FIXED: New RPC that ensures everyone spawns everyone (including themselves)
 @rpc("any_peer", "call_local", "reliable")
 func spawn_player_everywhere(player_id: int, player_type: String, team: int, spawn_position: Vector3):
 	print("Spawning player ", player_id, " as ", player_type, " locally")
@@ -384,3 +414,4 @@ func get_players_by_team(team: int) -> Array:
 			team_players.append(player)
 	
 	return team_players
+

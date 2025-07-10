@@ -110,11 +110,15 @@ func _physics_process(delta):
 	
 	# Only sync if we have a valid multiplayer setup and peers
 	if is_network_ready and can_use_rpc():
-		sync_state.rpc(global_transform.origin, velocity)
+		# Double-check multiplayer is still active right before RPC
+		if multiplayer and multiplayer.has_multiplayer_peer() and multiplayer.get_multiplayer_peer().get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED:
+			sync_state.rpc(global_transform.origin, velocity)
 
 func can_use_rpc() -> bool:
 	return (multiplayer and 
 			multiplayer.has_multiplayer_peer() and 
+			multiplayer.get_multiplayer_peer() != null and
+			multiplayer.get_multiplayer_peer().get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and
 			get_multiplayer_authority() != 0 and
 			multiplayer.get_peers().size() > 0)
 

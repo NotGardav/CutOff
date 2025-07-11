@@ -9,6 +9,10 @@ var players = {}
 var clients_ready = {}
 var player_teams = {}
 
+# Map generation state
+var map_generation_seed: int = 0
+var map_generation_complete = {}  # Track which clients have finished map generation
+
 # Preload player scenes
 var alien_scene = preload("res://scenes/Alien.tscn")
 var human_scene = preload("res://scenes/Human.tscn")
@@ -76,6 +80,8 @@ func _cleanup_player(id):
 		clients_ready.erase(id)
 	if id in player_teams:
 		player_teams.erase(id)
+	if id in map_generation_complete:
+		map_generation_complete.erase(id)
 
 func _check_game_scene_loaded():
 	if game_scene_loaded:
@@ -101,6 +107,7 @@ func _check_game_scene_loaded():
 		game_scene_loaded = true
 		print("Game scene loaded successfully with MapGenerator")
 		print("MapGenerator node path: ", map_generator.get_path())
+		print("MapGenerator supports procedural generation: ", map_generator.has_method("generate_base_layout"))
 		
 		# Import lobby data immediately when scene is ready
 		_import_lobby_data()
@@ -205,11 +212,19 @@ func _start_game_synchronized():
 	
 	# Clear any existing conflicting data
 	players.clear()
+	map_generation_complete.clear()
 	
-	# Generate map on ALL clients using RPC
-	print("Requesting map generation on all clients...")
-	rpc("generate_game_map_rpc")
-	await get_tree().create_timer(2.0).timeout  # Wait for map generation to complete
+	# Generate a shared seed for consistent maps across all clients
+	if multiplayer.is_server():
+		map_generation_seed = randi()
+		print("Server generated map seed: ", map_generation_seed)
+	
+	# Generate map on ALL clients using RPC with shared seed
+	print("Requesting synchronized map generation on all clients...")
+	rpc("generate_game_map_rpc", map_generation_seed)
+	
+	# Wait for all clients to complete map generation
+	await _wait_for_all_map_generation()
 	
 	# Then spawn players
 	await spawn_all_players()
@@ -223,17 +238,56 @@ func _start_game_synchronized():
 	# Notify all clients that game is ready
 	rpc("on_game_fully_ready")
 
-# NEW: RPC function to generate map on all clients
+func _wait_for_all_map_generation():
+	print("Waiting for all clients to complete map generation...")
+	
+	var expected_peers = multiplayer.get_peers()
+	expected_peers.append(multiplayer.get_unique_id())
+	
+	var max_wait_time = 30.0  # 30 seconds timeout
+	var wait_time = 0.0
+	var check_interval = 0.5
+	
+	while wait_time < max_wait_time:
+		var all_complete = true
+		
+		for peer_id in expected_peers:
+			if not map_generation_complete.get(peer_id, false):
+				print("Still waiting for map generation from peer: ", peer_id)
+				all_complete = false
+				break
+		
+		if all_complete:
+			print("All clients completed map generation!")
+			return
+		
+		await get_tree().create_timer(check_interval).timeout
+		wait_time += check_interval
+	
+	print("WARNING: Map generation timeout reached, proceeding anyway...")
+
 @rpc("any_peer", "call_local", "reliable")
-func generate_game_map_rpc():
-	print("=== GENERATING GAME MAP ON CLIENT ===")
+func generate_game_map_rpc(seed: int):
+	print("=== GENERATING SYNCHRONIZED GAME MAP ===")
 	print("Client ID: ", multiplayer.get_unique_id())
+	print("Using seed: ", seed)
 	print("Is server: ", multiplayer.is_server())
 	
 	if map_generator and is_instance_valid(map_generator):
-		print("MapGenerator found, generating layout...")
-		await map_generator.generate_base_layout()
-		print("Map generation complete on client ", multiplayer.get_unique_id())
+		print("MapGenerator found, generating layout with seed...")
+		
+		# Check if the map generator supports seeded generation
+		if map_generator.has_method("generate_base_layout"):
+			await map_generator.generate_base_layout(seed)
+			print("✓ Procedural map generation complete on client ", multiplayer.get_unique_id())
+		else:
+			# Fallback to old method if enhanced generator not available
+			print("Using legacy map generation method")
+			await map_generator.generate_base_layout()
+		
+		# Notify server that this client completed map generation
+		rpc_id(1, "map_generation_complete_notification", multiplayer.get_unique_id())
+		
 	else:
 		print("ERROR: MapGenerator not available on client ", multiplayer.get_unique_id())
 		print("Attempting to find MapGenerator again...")
@@ -249,16 +303,35 @@ func generate_game_map_rpc():
 			
 			if map_generator and is_instance_valid(map_generator):
 				print("Found MapGenerator on retry, generating layout...")
-				await map_generator.generate_base_layout()
-				print("Map generation complete on client ", multiplayer.get_unique_id())
+				if map_generator.has_method("generate_base_layout"):
+					await map_generator.generate_base_layout(seed)
+				else:
+					await map_generator.generate_base_layout()
+				print("✓ Map generation complete on client ", multiplayer.get_unique_id())
+				rpc_id(1, "map_generation_complete_notification", multiplayer.get_unique_id())
 			else:
 				print("CRITICAL ERROR: Still no MapGenerator found on client ", multiplayer.get_unique_id())
+				# Mark as complete anyway to prevent hanging
+				rpc_id(1, "map_generation_complete_notification", multiplayer.get_unique_id())
+
+@rpc("any_peer", "reliable")
+func map_generation_complete_notification(client_id: int):
+	if multiplayer.is_server():
+		print("Server received map generation complete from client: ", client_id)
+		map_generation_complete[client_id] = true
+	else:
+		# Clients also track their own completion
+		if client_id == multiplayer.get_unique_id():
+			map_generation_complete[client_id] = true
 
 @rpc("any_peer", "call_local", "reliable")
 func on_game_fully_ready():
 	print("Game is fully ready!")
-
-# REMOVED: Old generate_game_map function (replaced with RPC version)
+	
+	# Optional: Add any post-game-start setup here
+	if map_generator and map_generator.has_method("get_current_seed"):
+		var current_seed = map_generator.get_current_seed()
+		print("Current map seed: ", current_seed)
 
 func spawn_all_players():
 	print("Spawning all players...")
@@ -343,7 +416,14 @@ func get_spawn_position_for_team(team: int) -> Vector3:
 	if spawn_area:
 		return get_random_spawn_position(spawn_area)
 	else:
-		# Fallback positions
+		# Enhanced fallback positions - try to get positions from map generator
+		if map_generator and map_generator.has_method("get_random_room_position"):
+			var room_position = map_generator.get_random_room_position()
+			if room_position != Vector3.ZERO:
+				print("Using random room position for team ", team)
+				return room_position + Vector3(0, 2, 0)  # Spawn above room floor
+		
+		# Ultimate fallback positions
 		var fallback_positions = [
 			Vector3(0, 2, 0),
 			Vector3(5, 2, 0),
@@ -415,3 +495,32 @@ func get_players_by_team(team: int) -> Array:
 	
 	return team_players
 
+# NEW: Utility functions for procedural map integration
+func get_current_map_seed() -> int:
+	if map_generator and map_generator.has_method("get_current_seed"):
+		return map_generator.get_current_seed()
+	return map_generation_seed
+
+func get_room_at_position(world_pos: Vector3) -> Dictionary:
+	if map_generator and map_generator.has_method("get_room_at_position"):
+		return map_generator.get_room_at_position(world_pos)
+	return {}
+
+func get_random_room_position() -> Vector3:
+	if map_generator and map_generator.has_method("get_random_room_position"):
+		return map_generator.get_random_room_position()
+	return Vector3.ZERO
+
+# NEW: Debug function to regenerate map (useful for testing)
+func regenerate_map_with_seed(seed: int):
+	if not multiplayer.is_server():
+		print("Only server can regenerate map")
+		return
+	
+	if game_started:
+		print("Cannot regenerate map while game is running")
+		return
+	
+	print("Regenerating map with seed: ", seed)
+	map_generation_complete.clear()
+	rpc("generate_game_map_rpc", seed)

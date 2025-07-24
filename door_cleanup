@@ -1,0 +1,224 @@
+extends Node
+
+var cleanup_executed = false
+var current_generation_id = 0
+var last_cleaned_generation = -1
+
+@export var dungeon_generator_path: NodePath = "DungeonGenerator3D"
+var dungeon_generator: DungeonGenerator3D
+
+func _ready():
+	# Get reference to the dungeon generator
+	if dungeon_generator_path:
+		dungeon_generator = get_node(dungeon_generator_path)
+	else:
+		# Try to find it automatically
+		dungeon_generator = find_child("DungeonGenerator3D", true, false)
+	
+	if not dungeon_generator:
+		push_error("DoorCleanup: Could not find DungeonGenerator3D. Set dungeon_generator_path in the inspector.")
+		return
+	
+	# Connect to the done_generating signal
+	if dungeon_generator.has_signal("done_generating"):
+		dungeon_generator.done_generating.connect(_on_dungeon_done_generating)
+		print("Successfully connected to done_generating signal")
+	else:
+		push_error("DungeonGenerator3D does not have done_generating signal")
+
+func _on_dungeon_done_generating():
+	print("=== DUNGEON GENERATION COMPLETE - STARTING DOOR CLEANUP ===")
+	current_generation_id += 1
+	cleanup_executed = false
+	remove_unused_doors()
+
+func remove_unused_doors():
+	if not dungeon_generator:
+		push_error("No dungeon generator reference")
+		return
+	
+	if cleanup_executed:
+		print("Door cleanup already executed for generation ", current_generation_id)
+		return
+	
+	cleanup_executed = true
+	last_cleaned_generation = current_generation_id
+	
+	print("=== DOOR CLEANUP START (Generation: ", current_generation_id, ") ===")
+	
+	# Get all rooms from the RoomsContainer
+	var rooms_container = dungeon_generator.get_node_or_null("RoomsContainer")
+	if not rooms_container:
+		push_error("Could not find RoomsContainer")
+		return
+	
+	var all_rooms = []
+	for child in rooms_container.get_children():
+		if child.has_method("get_doors") and child.has_method("get_grid_pos"):
+			all_rooms.append(child)
+	
+	if all_rooms.is_empty():
+		push_error("No rooms found for door cleanup")
+		return
+	
+	print("Processing ", all_rooms.size(), " rooms for door cleanup")
+	
+	var room_positions = _build_room_position_map(all_rooms)
+	var cleanup_stats = _process_all_doors(all_rooms, room_positions)
+	
+	_print_cleanup_summary(cleanup_stats)
+
+func _build_room_position_map(rooms: Array) -> Dictionary:
+	var room_positions = {}
+	for room in rooms:
+		if not is_instance_valid(room) or not room.has_method("get_grid_pos"):
+			continue
+		
+		var grid_pos = room.get_grid_pos()
+		
+		# For each voxel the room occupies, map it to the room
+		if room.has_method("get_grid_aabbi"):
+			var aabbi = room.get_grid_aabbi(false) # false = without doors
+			for x in aabbi.size.x:
+				for y in aabbi.size.y:
+					for z in aabbi.size.z:
+						var voxel_pos = aabbi.position + Vector3i(x, y, z)
+						room_positions[voxel_pos] = room
+			print("Room '", room.name, "' occupies voxels from ", aabbi.position, " to ", aabbi.position + aabbi.size - Vector3i.ONE)
+		else:
+			# Fallback to just the room's grid position
+			room_positions[grid_pos] = room
+			print("Room '", room.name, "' at single grid position ", grid_pos)
+	
+	print("Total room position mappings: ", room_positions.size())
+	return room_positions
+
+func _process_all_doors(rooms: Array, room_positions: Dictionary) -> Dictionary:
+	var stats = {
+		"total_doors": 0,
+		"optional_doors": 0,
+		"required_doors": 0,
+		"doors_removed": 0,
+		"doors_to_free": []
+	}
+	
+	for room in rooms:
+		if not is_instance_valid(room) or not room.has_method("get_doors"):
+			continue
+		
+		print("\n--- Processing room: ", room.name, " ---")
+		_process_room_doors(room, room_positions, stats)
+	
+	# Safety check to prevent removing too many doors
+	if _should_prevent_mass_removal(stats):
+		return stats
+	
+	_remove_marked_doors(stats["doors_to_free"])
+	return stats
+
+func _process_room_doors(room: Node, room_positions: Dictionary, stats: Dictionary):
+	var room_doors = room.get_doors()
+	stats["total_doors"] += room_doors.size()
+	
+	for j in range(room_doors.size()):
+		var door = room_doors[j]
+		if not door:
+			continue
+		
+		# Check if door is optional (using direct property access)
+		var is_optional = door.optional
+		
+		if is_optional:
+			stats["optional_doors"] += 1
+		else:
+			stats["required_doors"] += 1
+		
+		# Debug door properties
+		print("  Door ", j, ":")
+		print("    Is optional: ", is_optional)
+		print("    Door node name: ", door.door_node.name if door.door_node else "null")
+		print("    Exit pos: ", door.exit_pos_grid)
+		print("    Grid pos: ", door.grid_pos)
+		
+		# Only process optional doors for removal
+		if is_optional and _should_remove_door(door, room_positions):
+			var door_node = door.door_node
+			if is_instance_valid(door_node):
+				stats["doors_to_free"].append(door_node)
+				stats["doors_removed"] += 1
+				print("    -> MARKED FOR REMOVAL (unused optional door)")
+			else:
+				print("    -> Would remove but door_node is invalid")
+		elif is_optional:
+			print("    -> KEEPING (optional door connects to adjacent room)")
+		else:
+			print("    -> KEEPING (required door)")
+
+func _should_remove_door(door, room_positions: Dictionary) -> bool:
+	# This function is only called for optional doors now
+	# Check if door leads to adjacent room
+	return not _is_door_connected_to_adjacent_room(door, room_positions)
+
+func _is_door_connected_to_adjacent_room(door, room_positions: Dictionary) -> bool:
+	# Use the exit_pos_grid property from the Door class
+	var exit_pos = door.exit_pos_grid
+	
+	if exit_pos == null:
+		print("    Could not determine door exit position - keeping door")
+		return true # Keep the door if we can't determine where it leads
+	
+	# Convert to Vector3i if needed
+	if exit_pos is Vector3:
+		exit_pos = Vector3i(exit_pos)
+	
+	var has_adjacent = room_positions.has(exit_pos)
+	print("    Door leads to: ", exit_pos, " -> adjacent room exists: ", has_adjacent)
+	
+	return has_adjacent
+
+func _should_prevent_mass_removal(stats: Dictionary) -> bool:
+	var total_doors = stats["total_doors"]
+	var optional_doors = stats["optional_doors"]
+	var doors_to_remove = stats["doors_to_free"].size()
+	
+	# If we're about to remove ALL optional doors and there are many, something might be wrong
+	if doors_to_remove == optional_doors and optional_doors > 10:
+		push_warning("About to remove ALL optional doors (", doors_to_remove, ") - position detection might be failing")
+		# Don't prevent it, but warn about it
+	
+	# Only prevent if we're somehow about to remove required doors (shouldn't happen)
+	var required_doors = stats["required_doors"]
+	if doors_to_remove > optional_doors:
+		push_error("ERROR: Trying to remove more doors than optional doors exist! Preventing removal.")
+		stats["doors_to_free"].clear()
+		stats["doors_removed"] = 0
+		return true
+	
+	# Allow removal of any number of optional doors - they're supposed to be removable
+	return false
+
+func _remove_marked_doors(doors_to_free: Array):
+	print("\n=== REMOVING OPTIONAL DOORS ===")
+	for door_node in doors_to_free:
+		if is_instance_valid(door_node):
+			print("Removing optional door: ", door_node.name)
+			door_node.queue_free()
+		else:
+			print("Skipping invalid door node")
+
+func _print_cleanup_summary(stats: Dictionary):
+	print("\n=== CLEANUP SUMMARY (Generation: ", current_generation_id, ") ===")
+	print("Total doors: ", stats["total_doors"])
+	print("Required doors: ", stats["required_doors"])
+	print("Optional doors: ", stats["optional_doors"])
+	print("Optional doors removed: ", stats["doors_removed"])
+	print("Doors remaining: ", stats["total_doors"] - stats["doors_removed"])
+
+# Public utility methods
+func reset_cleanup():
+	cleanup_executed = false
+	print("Door cleanup reset for generation ", current_generation_id)
+
+func force_cleanup():
+	cleanup_executed = false
+	remove_unused_doors()

@@ -46,22 +46,35 @@ func remove_unused_doors():
 	
 	print("=== DOOR CLEANUP START (Generation: ", current_generation_id, ") ===")
 	
-	# Get all rooms from the RoomsContainer
+	# Get all rooms from the RoomsContainer (generated rooms)
 	var rooms_container = dungeon_generator.get_node_or_null("RoomsContainer")
 	if not rooms_container:
 		push_error("Could not find RoomsContainer")
 		return
 	
 	var all_rooms = []
+	
+	# Add generated rooms from RoomsContainer
 	for child in rooms_container.get_children():
+		print("Found generated room in RoomsContainer: ", child.name, " (type: ", child.get_class(), ")")
 		if child.has_method("get_doors") and child.has_method("get_grid_pos"):
 			all_rooms.append(child)
+			print("  -> Added to processing list")
+	
+	# Also find pre-placed rooms in the main scene (these exist outside RoomsContainer)
+	var scene_root = get_tree().current_scene
+	var preplaced_rooms = _find_preplaced_rooms_in_scene(scene_root)
+	print("Found ", preplaced_rooms.size(), " pre-placed rooms in scene")
+	
+	for room in preplaced_rooms:
+		all_rooms.append(room)
+		print("Added pre-placed room: ", room.name)
 	
 	if all_rooms.is_empty():
 		push_error("No rooms found for door cleanup")
 		return
 	
-	print("Processing ", all_rooms.size(), " rooms for door cleanup")
+	print("Processing ", all_rooms.size(), " total rooms for door cleanup (", preplaced_rooms.size(), " pre-placed, ", all_rooms.size() - preplaced_rooms.size(), " generated)")
 	
 	var room_positions = _build_room_position_map(all_rooms)
 	var cleanup_stats = _process_all_doors(all_rooms, room_positions)
@@ -99,6 +112,7 @@ func _process_all_doors(rooms: Array, room_positions: Dictionary) -> Dictionary:
 		"optional_doors": 0,
 		"required_doors": 0,
 		"doors_removed": 0,
+		"doors_preserved": 0,
 		"doors_to_free": []
 	}
 	
@@ -120,6 +134,11 @@ func _process_room_doors(room: Node, room_positions: Dictionary, stats: Dictiona
 	var room_doors = room.get_doors()
 	stats["total_doors"] += room_doors.size()
 	
+	# Check if this is a pre-placed room
+	var is_preplaced = _is_preplaced_room(room)
+	if is_preplaced:
+		print("  This is a PRE-PLACED room - preserving all doors")
+	
 	for j in range(room_doors.size()):
 		var door = room_doors[j]
 		if not door:
@@ -140,8 +159,12 @@ func _process_room_doors(room: Node, room_positions: Dictionary, stats: Dictiona
 		print("    Exit pos: ", door.exit_pos_grid)
 		print("    Grid pos: ", door.grid_pos)
 		
-		# Only process optional doors for removal
-		if is_optional and _should_remove_door(door, room_positions):
+		# Special handling for pre-placed rooms
+		if is_preplaced:
+			print("    -> PRESERVED (pre-placed room door)")
+			stats["doors_preserved"] += 1
+		# Only process optional doors for removal (and only if not in pre-placed room)
+		elif is_optional and _should_remove_door(door, room_positions):
 			var door_node = door.door_node
 			if is_instance_valid(door_node):
 				stats["doors_to_free"].append(door_node)
@@ -153,6 +176,32 @@ func _process_room_doors(room: Node, room_positions: Dictionary, stats: Dictiona
 			print("    -> KEEPING (optional door connects to adjacent room)")
 		else:
 			print("    -> KEEPING (required door)")
+
+func _find_preplaced_rooms_in_scene(node: Node) -> Array:
+	var preplaced_rooms = []
+	
+	# Check if this node is a DungeonRoom3D
+	if node.get_script() and node.get_script().get_global_name() == "DungeonRoom3D":
+		# Check if it has the specific names of your pre-placed rooms
+		if node.name == "DungeonRoom3D3" or node.name == "DungeonRoom3D":
+			print("Found pre-placed room: ", node.name)
+			preplaced_rooms.append(node)
+			return preplaced_rooms
+	
+	# Recursively search children
+	for child in node.get_children():
+		preplaced_rooms.append_array(_find_preplaced_rooms_in_scene(child))
+	
+	return preplaced_rooms
+
+func _is_preplaced_room(room: Node) -> bool:
+	# Simply check if it's one of the specific pre-placed rooms by name
+	if room.name == "DungeonRoom3D3" or room.name == "DungeonRoom3D":
+		print("    -> IDENTIFIED as pre-placed room by name: ", room.name)
+		return true
+	
+	print("    -> NOT a pre-placed room (name: ", room.name, ")")
+	return false
 
 func _should_remove_door(door, room_positions: Dictionary) -> bool:
 	# This function is only called for optional doors now
@@ -211,6 +260,7 @@ func _print_cleanup_summary(stats: Dictionary):
 	print("Total doors: ", stats["total_doors"])
 	print("Required doors: ", stats["required_doors"])
 	print("Optional doors: ", stats["optional_doors"])
+	print("Pre-placed room doors preserved: ", stats["doors_preserved"])
 	print("Optional doors removed: ", stats["doors_removed"])
 	print("Doors remaining: ", stats["total_doors"] - stats["doors_removed"])
 
